@@ -13,15 +13,17 @@ import (
 	"os"
 	"time"
 
-	"github.com/itouakirai/mp4ff/mp4"
 	"github.com/grafov/m3u8"
+	"github.com/itouakirai/mp4ff/mp4"
 
 	"encoding/binary"
 	"github.com/schollz/progressbar/v3"
 
 	"main/utils/structs"
 )
+
 const prefetchKey = "skd://itunes.apple.com/P000000000/s1/e1"
+
 var ErrTimeout = errors.New("response timed out")
 
 type TimedResponseBody struct {
@@ -42,7 +44,6 @@ func (b *TimedResponseBody) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
-
 
 func Run(adamId string, playlistUrl string, outfile string, Config structs.ConfigSet) error {
 	var err error
@@ -118,7 +119,7 @@ func Run(adamId string, playlistUrl string, outfile string, Config structs.Confi
 			return err
 		}
 		defer do.Body.Close()
-		if do.ContentLength < int64(Config.MaxMemoryLimit * 1024 * 1024) {
+		if do.ContentLength < int64(Config.MaxMemoryLimit*1024*1024) {
 			var buffer bytes.Buffer
 			bar := progressbar.NewOptions64(
 				do.ContentLength,
@@ -454,6 +455,7 @@ func TransformInit(init *mp4.InitSegment) (map[uint32]mp4.DecryptTrackInfo, erro
 	}
 	return tracks, nil
 }
+
 //remote
 // Reset the loops on the script's end and close the connection
 func Close(conn io.WriteCloser) error {
@@ -477,20 +479,16 @@ func SendString(conn io.Writer, uri string) error {
 	return err
 }
 
-
-
 func cbcsFullSubsampleDecrypt(data []byte, conn *bufio.ReadWriter) error {
-	// Drops 4 last bits -> multiple of 16
-	// It wouldn't hurt to send the remaining bytes also because the decryption
-	// function would just return them as-is, but we're truncating the data here
-	// for clarity and interoperability
-	truncatedLen := len(data) & ^0xf
-	// send the whole chunk at once
-	err := binary.Write(conn, binary.LittleEndian, uint32(truncatedLen))
+	// Apple Music ALAC samples may store audio bits and the ALAC end tag in the
+	// final non-block-aligned bytes. Send the complete protected range to the
+	// device decryptor; truncating to AES block size leaves those tail bytes
+	// encrypted and produces packets that FFmpeg can only partially repair.
+	err := binary.Write(conn, binary.LittleEndian, uint32(len(data)))
 	if err != nil {
 		return err
 	}
-	_, err = conn.Write(data[:truncatedLen])
+	_, err = conn.Write(data)
 	if err != nil {
 		return err
 	}
@@ -498,7 +496,7 @@ func cbcsFullSubsampleDecrypt(data []byte, conn *bufio.ReadWriter) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.ReadFull(conn, data[:truncatedLen])
+	_, err = io.ReadFull(conn, data)
 	return err
 }
 
