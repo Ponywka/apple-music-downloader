@@ -122,7 +122,11 @@ type alacParams struct {
 	channels           uint8
 }
 
-func decodeScalar(br *bitReader, k int, bps int) (uint32, error) {
+// decodeScalar reads one Rice-coded scalar. ffmpegCompat selects whether to
+// match FFmpeg's bit-exact behaviour (extrabits != 0 → skip k bits) or the
+// approximate variant (extrabits > 1 → skip k bits) used for TYPE_END
+// boundary detection on normal (already-terminated) packets.
+func decodeScalar(br *bitReader, k int, bps int, ffmpegCompat bool) (uint32, error) {
 	x, err := br.unary09()
 	if err != nil {
 		return 0, err
@@ -136,7 +140,7 @@ func decodeScalar(br *bitReader, k int, bps int) (uint32, error) {
 			return 0, err
 		}
 		x = (x << uint(k)) - x
-		if extrabits > 1 {
+		if (ffmpegCompat && extrabits != 0) || (!ffmpegCompat && extrabits > 1) {
 			x += extrabits - 1
 			if err := br.skip(k); err != nil {
 				return 0, err
@@ -150,15 +154,15 @@ func decodeScalar(br *bitReader, k int, bps int) (uint32, error) {
 	return x, nil
 }
 
-func riceDecompress(br *bitReader, nbSamples int, bps int, rhmEff uint32, p *alacParams) error {
+func riceDecompress(br *bitReader, nbSamples int, bps int, rhmEff uint32, p *alacParams, ffmpegCompat bool) error {
 	history := uint32(p.riceInitialHistory)
 	signMod := uint32(0)
 	limit := int(p.riceLimit)
-	cap := nbSamples*4 + 100
+	maxIters := nbSamples*4 + 100
 	iters := 0
 	for i := 0; i < nbSamples; {
 		iters++
-		if iters > cap {
+		if iters > maxIters {
 			return errors.New("rice runaway")
 		}
 		if br.left() <= 0 {
@@ -168,7 +172,7 @@ func riceDecompress(br *bitReader, nbSamples int, bps int, rhmEff uint32, p *ala
 		if k > limit {
 			k = limit
 		}
-		x, err := decodeScalar(br, k, bps)
+		x, err := decodeScalar(br, k, bps, ffmpegCompat)
 		if err != nil {
 			return err
 		}
@@ -184,7 +188,7 @@ func riceDecompress(br *bitReader, nbSamples int, bps int, rhmEff uint32, p *ala
 			if k2 > limit {
 				k2 = limit
 			}
-			blockSize, err := decodeScalar(br, k2, 16)
+			blockSize, err := decodeScalar(br, k2, 16, ffmpegCompat)
 			if err != nil {
 				return err
 			}
@@ -206,7 +210,8 @@ func riceDecompress(br *bitReader, nbSamples int, bps int, rhmEff uint32, p *ala
 
 // scanOneElement consumes one element from br. Returns (channels_used,
 // is_end_tag, error). If an unsupported element tag is hit, returns an error.
-func scanOneElement(br *bitReader, p *alacParams) (int, bool, error) {
+// ffmpegCompat selects which extrabits branch to use in decodeScalar.
+func scanOneElement(br *bitReader, p *alacParams, ffmpegCompat bool) (int, bool, error) {
 	elem, err := br.read(3)
 	if err != nil {
 		return 0, false, err
@@ -303,7 +308,7 @@ func scanOneElement(br *bitReader, p *alacParams) (int, bool, error) {
 		}
 		for c := 0; c < channels; c++ {
 			rhmEff := (rhms[c] * uint32(p.riceHistoryMult)) / 4
-			if err := riceDecompress(br, int(outputSamples), bps, rhmEff, p); err != nil {
+			if err := riceDecompress(br, int(outputSamples), bps, rhmEff, p, ffmpegCompat); err != nil {
 				return 0, false, err
 			}
 		}
@@ -319,27 +324,59 @@ func scanOneElement(br *bitReader, p *alacParams) (int, bool, error) {
 	return channels, false, nil
 }
 
-// findBodyEndBit returns the bit position right after the last non-END
-// element body. -1 means parse failure.
-func findBodyEndBit(packet []byte, p *alacParams) int {
+// scanBodyEnd runs one pass over the packet's element bodies using the given
+// ffmpegCompat mode. Returns (lastEnd, hasTypeEnd):
+//   - lastEnd: bit position right after the last successfully parsed element body
+//   - hasTypeEnd: true if TYPE_END was found immediately after the channel data
+//
+// lastEnd == -1 means the packet could not be parsed at all.
+func scanBodyEnd(packet []byte, p *alacParams, ffmpegCompat bool) (lastEnd int, hasTypeEnd bool) {
 	br := newBitReader(packet)
 	chUsed := 0
-	lastEnd := -1
+	lastEnd = -1
 	for br.left() >= 3 {
-		nCh, isEnd, err := scanOneElement(br, p)
+		nCh, isEnd, err := scanOneElement(br, p, ffmpegCompat)
 		if err != nil {
-			return -1
+			return -1, false
 		}
 		if isEnd {
-			return br.pos
+			return br.pos - 3, true
 		}
 		lastEnd = br.pos
 		chUsed += nCh
 		if chUsed >= int(p.channels) {
-			return lastEnd
+			// All channel data consumed. Peek at the next 3 bits to check for TYPE_END.
+			if br.left() >= 3 {
+				if tag, _ := br.show(3); tag == 7 {
+					return lastEnd, true
+				}
+			}
+			return lastEnd, false
 		}
 	}
-	return lastEnd
+	return lastEnd, false
+}
+
+// findBodyEndBit returns the bit position where TYPE_END should be inserted,
+// or -1 if the packet already has TYPE_END (or cannot be parsed).
+//
+// Two-pass strategy: the approximate scanner (extrabits > 1) is used first
+// because it coincidentally stops exactly at the TYPE_END boundary for
+// well-formed packets, giving a clean TYPE_END check. Only when a packet is
+// confirmed broken does the FFmpeg-exact scanner (extrabits != 0) run to find
+// the true data end, which is where TYPE_END must be written.
+func findBodyEndBit(packet []byte, p *alacParams) int {
+	// Pass 1: approximate scan (extrabits > 1).
+	approxEnd, hasTypeEnd := scanBodyEnd(packet, p, false)
+	if hasTypeEnd || approxEnd < 0 {
+		return -1 // well-formed or unparseable
+	}
+	// Pass 2: FFmpeg-exact scan to find the true data end.
+	exactEnd, hasTypeEnd2 := scanBodyEnd(packet, p, true)
+	if hasTypeEnd2 || exactEnd < 0 {
+		return -1
+	}
+	return exactEnd
 }
 
 // ---------- ISO BMFF walker -------------------------------------------------
